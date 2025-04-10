@@ -291,7 +291,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = False
 if use_compile:
     # torch.compile将整个神经网络编译成一个不涉及python interpreter的单一对象；减少了Python的开销和GPU与HBM之间的读写次数。
     # 内存遍布整个芯片，如 L1和L2 cache，但这些内存与HBM中内存的存储方式不同，再具体我就不懂了。
