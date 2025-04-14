@@ -232,7 +232,8 @@ def get_most_likely_row(tokens, mask, logits):
     return pred_norm
 
 # -----------------------------------------------------------------------------
-# 训练
+# 训练 GeForce RTX 4090 (24G) * 4
+# torchrun --standalone --nproc_per_node=4 train.py
 
 # torchrun 命令会设置环境变量 RANK、LOCAL_RANK 和 WORLD_SIZE
 ddp = int(os.environ.get('RANK', -1)) != -1     # 是否DDP运行
@@ -271,7 +272,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2**19, ~0.5M, 模拟GPT-3 Small
-B = 4      # 如果遇到内存不足，可以尝试减小批次大小
+B = 16      # 如果遇到内存不足，可以尝试减小批次大小
 T = 1024    # 序列长度
 # 计算梯度累积步数
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -300,12 +301,12 @@ if use_compile:
 if ddp:
     # 一旦反向传播结束，DDP会对所有等级上的梯度进行平均，每个都会得到这个平均值
     model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+raw_model = model.module if ddp else model  # raw_model 始终指向的是原始模型，而不是 DDP 包装器。
 
 max_lr = 6e-4               # 最大学习率
 min_lr = max_lr * 0.1       # 最小学习率
 warmup_steps = 715  #gpt3论文提到warmup over the first 3.75 million tokens,所以3750000000 / 2**19 = 715
-max_steps = 19073 # 10e9 / 2**19
+max_steps = 19073 # 处理100亿个tokens，所以 10e9 / 2**19
 def get_lr(it):
     # 1) 预热
     if it < warmup_steps:
@@ -422,7 +423,7 @@ for step in range(max_steps):
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     # clip the global norm of the gradient at 1.0,防止模型在梯度大小方面受到过大的冲击    
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)      # clip the global norm of the gradient at 1.0,防止模型在梯度大小方面受到过大的冲击
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)      
     # 确定并设定本次迭代的学习率
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
