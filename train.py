@@ -11,7 +11,57 @@ import numpy as np
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from kernel import act_quant, weight_dequant, fp8_gemm
+from typing import Tuple, Optional, Literal
 # -----------------------------------------------------------------------------
+
+b_size = 128    # 量化块size
+gemm_impl: Literal["bf16", "fp8"] = "fp8"
+
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    
+    if gemm_impl == "bf16":
+        weight = weight_dequant(weight, weight.scale)
+        return F.linear(x, weight, bias)
+    else:
+        x, scale = act_quant(x, b_size)
+        weight, weight.scale = act_quant(weight, b_size)
+        
+        y = fp8_gemm(x, scale, weight, weight.scale)
+        
+        if bias is not None:
+            y += bias
+        
+        return y
+
+
+class Linear(nn.Module):
+    
+    dtype = torch.bfloat16
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the custom linear layer.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Transformed tensor after linear computation.
+        """
+        return linear(x, self.weight, self.bias)
 
 class CausalSelfAttention(nn.Module):
     #这些头就像是并行的流，他们的输出被拼接起来
@@ -20,16 +70,18 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # 768,3*768,参考gpt2
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn = Linear(config.n_embd, 3 * config.n_embd)
+        
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1      # 初始化缩放比例为1
+        self.c_proj = Linear(config.n_embd, config.n_embd)
+        self.c_proj.RESIDUAL_LAYER_W_INIT = 1      # 初始化缩放比例为1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
     def forward(self, x):
-        B, T, C = x.size()     # 批量大小、序列长度、嵌入维度（n_embd）
+        
+        B, T, C = x.size()     # 批次大小、序列长度、嵌入维度（n_embd）
         # 在 GPT-2（124M）模型中，n_head=12，hs=64，因此 nh*hs=768 个通道在 Transformer 架构中。
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
@@ -38,8 +90,10 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # flash attention 已经出了3篇论文了
         # Fused Kernels 减少内核调用开销‌,提高内存访问效率‌,优化指令流水线
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) 
-        y = y.transpose(1, 2).contiguous().view(B, T, C) 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
         # output projection
         y = self.c_proj(y)
         return y
@@ -48,10 +102,10 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_fc    = Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj  = Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.RESIDUAL_LAYER_W_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -82,12 +136,14 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    dtype: Literal["bf16", "fp8"] = "fp8"
 
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.config = config
+        Linear.dtype = torch.float8_e4m3fn if config.dtype == "fp8" else torch.bfloat16
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),               #token embeddings
@@ -104,9 +160,9 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, Linear)):
             std = 0.02  # 0.02是gpt2的初始化标准差,1/sqrt(768)=0.0365,1/sqrt(1600)=0.025
-            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            if hasattr(module, 'RESIDUAL_LAYER_W_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5        
                 #gpt2论文中提到的残差层权重按 1/sqrt(n) 的系数缩放，2是因为Block中有注意力和MLP
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
@@ -132,7 +188,9 @@ class GPT(nn.Module):
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            i_tensor = logits.view(-1, logits.size(-1))
+            t_tensor = targets.view(-1)
+            loss = F.cross_entropy(i_tensor, t_tensor)
         return logits, loss
 
     
@@ -211,27 +269,6 @@ class DataLoaderLite:
         return x, y
 
 # -----------------------------------------------------------------------------
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-
-def get_most_likely_row(tokens, mask, logits):
-    
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    
-    shift_mask = (mask[..., 1:]).contiguous() 
-    masked_shift_losses = shift_losses * shift_mask
-    
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
-
-# -----------------------------------------------------------------------------
 # 训练 GeForce RTX 4090 (24G) * 4
 # torchrun --standalone --nproc_per_node=4 train.py
 
@@ -249,7 +286,7 @@ if ddp:
     master_process = ddp_rank == 0  # 此 master_process 将执行日志记录、检查点处理等操作。
     device_type = "cuda" if device.startswith("cuda") else "cpu"
 else:
-    # 用不了ddp的情况。。。心塞
+    # 用不了ddp的情况。。。
     ddp_rank = 0
     ddp_local_rank = 0
     ddp_world_size = 1
@@ -271,8 +308,9 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, 模拟GPT-3 Small
-B = 16      # 如果遇到内存不足，可以尝试减小批次大小
+# total_batch_size = 524288 # 2**19, ~0.5M, 模拟GPT-3 Small
+total_batch_size = 589824 # 引入fp8后，内存有空闲了，可以增大
+B = 24      # 如果遇到内存不足，可以尝试减小批次大小
 T = 1024    # 序列长度
 # 计算梯度累积步数
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
@@ -286,7 +324,7 @@ train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
       
 # 启用TF32精度，一个符号位，八个指数位,精度最后13位被截断丢弃，最终只有19位，为了提升速度，降低了精度。指数决定范围，精度决定精确程度
-torch.set_float32_matmul_precision('high')
+# torch.set_float32_matmul_precision('high')    会与fp8冲突
 
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
@@ -300,13 +338,13 @@ if use_compile:
     model = torch.compile(model)
 if ddp:
     # 一旦反向传播结束，DDP会对所有等级上的梯度进行平均，每个都会得到这个平均值
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 raw_model = model.module if ddp else model  # raw_model 始终指向的是原始模型，而不是 DDP 包装器。
 
 max_lr = 6e-4               # 最大学习率
 min_lr = max_lr * 0.1       # 最小学习率
 warmup_steps = 715  #gpt3论文提到warmup over the first 3.75 million tokens,所以3750000000 / 2**19 = 715
-max_steps = 19073 # 处理100亿个tokens，所以 10e9 / 2**19
+max_steps = 16954 # 处理100亿个tokens，所以 10e9 / total_batch_size
 def get_lr(it):
     # 1) 预热
     if it < warmup_steps:
@@ -345,8 +383,9 @@ for step in range(max_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 # 混合精度尝试将每个操作与最适合它的数据类型相匹配，这能够减少运行时间和内存占用量。torch.autocast 实例充当上下文管理器的角色
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):   与fp8冲突
+                logits, loss = model(x, y)
+
                 loss = loss / val_loss_steps        # cross_entropy的参数reduction='mean'默认是对每个batch的loss求平均值
                 val_loss_accum += loss.detach()     # 从当前计算图中分离，不计算梯度
         if ddp:
@@ -382,8 +421,8 @@ for step in range(max_steps):
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
+                # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):   与fp8冲突
+                logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -403,7 +442,7 @@ for step in range(max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
-    
+    # 训练-------------------------
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -413,8 +452,8 @@ for step in range(max_steps):
         # 反向梯度同步只在 micro_step 的最后一步进行
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+        # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):   与fp8冲突
+        logits, loss = model(x, y)
         # 必须对损失值进行调整以考虑梯度累积，因为在每次的反向传播中，梯度只是累加起来
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
